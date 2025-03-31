@@ -1,0 +1,172 @@
+clc; clear; close all;
+
+% Settings
+preDropTime = 10;
+postDropTime = 30;
+minLength = 10;
+baselineWindow = [-5, -1];
+fretDropThreshold = -1.0;
+
+% File loading
+matFiles = dir('vesicle*.mat');
+if isempty(matFiles)
+    error('No vesicle*.mat files found.');
+end
+
+allVesicles = {};
+allRatios = {};
+allTimes = {};
+fretDropTimes = [];
+
+for i = 1:length(matFiles)
+    load(matFiles(i).name, 'selection');
+
+    vesicle = selection.vesicleValues(:)';
+    ratio   = selection.ratioValues(:)';
+    time    = selection.timePoints(:)';
+
+    % Step 1: Smooth vesicle and detect drop onset via derivative
+    vesicleSmooth = movmean(vesicle, 3);
+    dV = [0, diff(vesicleSmooth)];
+    [~, dropIdx] = min(dV);  % Most negative slope
+    tDrop = time(dropIdx);
+
+    % Step 2: Define window around drop
+    tStart = tDrop - preDropTime;
+    tEnd   = tDrop + postDropTime;
+    idxWin = find(time >= tStart & time <= tEnd);
+
+    if numel(idxWin) < minLength || dropIdx <= 5
+        warning('Skipping %s due to invalid drop window.', matFiles(i).name);
+        continue;
+    end
+
+    % Step 3: Extract and align
+    tAligned = time(idxWin) - tDrop;
+    vesWin = vesicle(idxWin);
+    ratioWin = ratio(idxWin);
+
+    % Step 4: Normalize using pre-drop baseline (median in defined window)
+    preIdx = find(tAligned >= baselineWindow(1) & tAligned <= baselineWindow(2));
+    if numel(preIdx) < 3
+        warning('Not enough pre-drop points in %s. Skipping.', matFiles(i).name);
+        continue;
+    end
+
+    baselineV = median(vesWin(preIdx));
+    baselineR = median(ratioWin(preIdx));
+
+    vesNorm = vesWin / baselineV * 100;
+    ratioNorm = ratioWin / baselineR * 100;
+
+    allTimes{end+1} = tAligned;
+    allVesicles{end+1} = vesNorm;
+    allRatios{end+1} = ratioNorm;
+
+    % Step 5: Detect FRET drop onset (most negative slope pre-drop)
+    rSmooth = movmean(ratioNorm, 3);
+    dR = [0, diff(rSmooth)];
+    preFRET = find(tAligned < 0);
+    [minVal, minIdx] = min(dR(preFRET));
+    if minVal < fretDropThreshold
+        fretDropTimes(end+1) = tAligned(preFRET(minIdx));
+    end
+end
+
+% Pad traces to same length
+maxLen = max(cellfun(@length, allTimes));
+pad = @(x) [x, NaN(1, maxLen - length(x))];
+
+% Pad the cell arrays and concatenate
+vesiclePadded = cellfun(pad, allVesicles, 'UniformOutput', false);
+ratioPadded   = cellfun(pad, allRatios,   'UniformOutput', false);
+timePadded    = cellfun(pad, allTimes,    'UniformOutput', false);
+
+vesicleMat = vertcat(vesiclePadded{:});
+ratioMat   = vertcat(ratioPadded{:});
+timeMat     = vertcat(timePadded{:});
+
+% Mean ± SEM
+meanVesicle = nanmean(vesicleMat, 1);
+semVesicle  = nanstd(vesicleMat, 0, 1) ./ sqrt(sum(~isnan(vesicleMat), 1));
+
+meanRatio   = nanmean(ratioMat, 1);
+semRatio    = nanstd(ratioMat, 0, 1) ./ sqrt(sum(~isnan(ratioMat), 1));
+
+meanTime    = nanmean(timeMat, 1);
+
+%% ⬛ Mean ± SEM Plot
+figure('Color', 'w', 'Position', [300 300 800 500]);
+
+yyaxis left
+errorbar(meanTime, meanVesicle, semVesicle, 'b-', 'LineWidth', 2);
+ylabel('Vesicle Intensity (Normalized to 100)');
+ylim([0 120]);
+
+yyaxis right
+errorbar(meanTime, meanRatio, semRatio, '-', 'Color', [0.8500 0.3250 0.0980], 'LineWidth', 2);
+ylabel('Ratiometric FRET (Normalized to 100)');
+ylim([0 120]);
+
+xline(0, '--k', 'Drop (t=0)', 'LabelOrientation', 'horizontal');
+xlabel('Time from Vesicle Drop (s)');
+title('Synchronized Mean ± SEM: Vesicle and FRET (Drop Aligned)');
+legend({'Vesicle ± SEM', 'FRET Ratio ± SEM'}, 'Location', 'best');
+grid on;
+
+%% ⬛ FRET Drop Onset Histogram
+figure('Color', 'w');
+histogram(fretDropTimes, 'BinWidth', 0.5, 'FaceColor', [1 0.4 0]);
+xlabel('FRET Drop Onset (s, rel. to vesicle drop)');
+ylabel('Number of Events');
+title('Timing of FRET Drop Relative to Exocytosis');
+xline(0, '--k', 'Fusion (t=0)'); grid on;
+
+validFRET = fretDropTimes(~isnan(fretDropTimes));
+fprintf('Mean FRET drop onset: %.2f s\n', mean(validFRET));
+fprintf('%% of FRET drops before fusion: %.1f%%\n', ...
+    100 * sum(validFRET < 0) / numel(validFRET));
+
+%% Save CSV
+T = table(meanTime', meanVesicle', semVesicle', meanRatio', semRatio', ...
+    'VariableNames', {'Time_s', 'Mean_Vesicle', 'SEM_Vesicle', 'Mean_Ratio', 'SEM_Ratio'});
+writetable(T, 'Aligned_Mean_SEM_DropOnset.csv');
+
+%% Save all synchronized individual traces to CSV
+synchTable = table();
+for i = 1:length(allTimes)
+    if isempty(allTimes{i}) || isempty(allVesicles{i}) || isempty(allRatios{i})
+        continue;
+    end
+
+    t = allTimes{i}(:);
+    v = allVesicles{i}(:);
+    r = allRatios{i}(:);
+    n = numel(t);
+
+    % Skip if mismatch in lengths
+    if length(v) ~= n || length(r) ~= n
+        warning('Trace %d skipped due to mismatched lengths.', i);
+        continue;
+    end
+
+    temp = table( ...
+        repmat(i, n, 1), ...              % Trace ID
+        t, ...
+        v, ...
+        r, ...
+        'VariableNames', {'TraceID', 'Time_s', 'Vesicle_Norm', 'FRET_Norm'});
+    synchTable = [synchTable; temp]; %#ok<AGROW>
+end
+
+% Export Full Trace Table
+writetable(synchTable, 'All_Synchronized_Traces.csv');
+fprintf('✅ Saved %d traces to All_Synchronized_Traces.csv\n', numel(unique(synchTable.TraceID)));
+
+% Round output values in CSV (optional but cleaner)
+synchTable.Vesicle_Norm = round(synchTable.Vesicle_Norm, 2);
+synchTable.FRET_Norm = round(synchTable.FRET_Norm, 2);
+synchTable.Time_s = round(synchTable.Time_s, 3);
+
+% Add Timestamp (Optional)
+fprintf('Script completed on %s\n', datestr(now, 'yyyy-mm-dd HH:MM:SS'));

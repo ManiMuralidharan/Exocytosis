@@ -1,0 +1,297 @@
+import os
+import glob
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter1d
+from scipy.stats import wilcoxon, ttest_1samp, binomtest
+
+# ==========================================
+# 0. Global plot settings (Arial font, no grids)
+# ==========================================
+plt.rcParams['font.family'] = 'Arial'          # Set axis labels & titles to Arial
+plt.rcParams['axes.grid'] = False              # No grid by default
+save_formats = ['png', 'svg', 'pdf']           # Desired output formats
+
+# ==========================================
+# 1. Settings
+# ==========================================
+data_dir = r'C:\Users\mmani3\Desktop\Exocytosis'   # No trailing backslash
+pre_drop_time = 10.0
+post_drop_time = 30.0
+min_length = 10
+baseline_window = [-5.0, -1.0]
+
+fret_drop_threshold = -1.0
+search_window_limit = [-10.0, 5.0]
+
+# ==========================================
+# 2. File Loading & Pre-allocation
+# ==========================================
+csv_files = glob.glob(os.path.join(data_dir, 'vesicle*.csv'))
+if not csv_files:
+    raise FileNotFoundError(f"No CSV files found in {data_dir}")
+
+num_files = len(csv_files)
+all_vesicles = []
+all_ratios = []
+all_times = []
+file_names_passed = []
+
+fret_drop_times = np.full(num_files, np.nan)
+fusion_times = np.full(num_files, np.nan)
+valid_file_mask = np.zeros(num_files, dtype=bool)
+
+# ==========================================
+# 3. Main Data Loop
+# ==========================================
+print(f"Found {num_files} files. Starting analysis...")
+
+for i, filepath in enumerate(csv_files):
+    filename = os.path.basename(filepath)
+    try:
+        df = pd.read_csv(filepath)
+        time = df['TimePoints'].values
+        vesicle = df['Vesicle_Intensity'].values
+        ratio = df['FRET_Ratio'].values
+
+        vesicle_smooth = gaussian_filter1d(vesicle, sigma=1)
+        dV = np.insert(np.diff(vesicle_smooth), 0, 0)
+        drop_idx = np.argmin(dV)
+        t_drop = time[drop_idx]
+        fusion_times[i] = t_drop
+
+        t_start = t_drop - pre_drop_time
+        t_end = t_drop + post_drop_time
+        idx_win = np.where((time >= t_start) & (time <= t_end))[0]
+
+        if len(idx_win) < min_length or drop_idx <= 5:
+            print(f"Skipping {filename}: Invalid drop window.")
+            continue
+
+        t_aligned = time[idx_win] - t_drop
+        ves_win = vesicle[idx_win]
+        ratio_win = ratio[idx_win]
+
+        pre_idx = np.where((t_aligned >= baseline_window[0]) & (t_aligned <= baseline_window[1]))[0]
+        if len(pre_idx) < 3:
+            print(f"Skipping {filename}: Not enough pre-drop points.")
+            continue
+
+        baseline_v = np.median(ves_win[pre_idx])
+        baseline_r = np.median(ratio_win[pre_idx])
+
+        ves_norm = (ves_win / baseline_v) * 100.0
+        ratio_norm = (ratio_win / baseline_r) * 100.0
+
+        all_times.append(t_aligned)
+        all_vesicles.append(ves_norm)
+        all_ratios.append(ratio_norm)
+        file_names_passed.append(filename)
+        valid_file_mask[i] = True
+
+        r_smooth = gaussian_filter1d(ratio_norm, sigma=1)
+        dR = np.insert(np.diff(r_smooth), 0, 0)
+
+        valid_window_idx = np.where((t_aligned >= search_window_limit[0]) & (t_aligned <= search_window_limit[1]))[0]
+
+        if len(valid_window_idx) > 0:
+            min_val = np.min(dR[valid_window_idx])
+            min_idx_relative = np.argmin(dR[valid_window_idx])
+            min_idx = valid_window_idx[min_idx_relative]
+
+            if min_val <= fret_drop_threshold:
+                fret_drop_times[i] = t_aligned[min_idx]
+
+    except Exception as e:
+        print(f"Error processing {filename}: {e}")
+
+# ==========================================
+# 4. Trace Padding and Mean/SEM Calculations
+# ==========================================
+if not all_times:
+    raise RuntimeError("No valid traces passed the filters. Check your data and thresholds.")
+
+max_len = max(len(t) for t in all_times)
+
+vesicle_mat = np.full((len(all_vesicles), max_len), np.nan)
+ratio_mat = np.full((len(all_ratios), max_len), np.nan)
+time_mat = np.full((len(all_times), max_len), np.nan)
+
+for j in range(len(all_times)):
+    length = len(all_times[j])
+    vesicle_mat[j, :length] = all_vesicles[j]
+    ratio_mat[j, :length] = all_ratios[j]
+    time_mat[j, :length] = all_times[j]
+
+mean_vesicle = np.nanmean(vesicle_mat, axis=0)
+sem_vesicle = np.nanstd(vesicle_mat, axis=0) / np.sqrt(np.sum(~np.isnan(vesicle_mat), axis=0))
+
+mean_ratio = np.nanmean(ratio_mat, axis=0)
+sem_ratio = np.nanstd(ratio_mat, axis=0) / np.sqrt(np.sum(~np.isnan(ratio_mat), axis=0))
+
+mean_time = np.nanmean(time_mat, axis=0)
+
+# ==========================================
+# 5. Unbiased Statistics & Reporting (ONE-TAILED)
+# ==========================================
+passed_threshold = ~np.isnan(fret_drop_times)
+valid_fret = fret_drop_times[passed_threshold]
+
+total_analyzed = np.sum(valid_file_mask)
+num_passed = len(valid_fret)
+num_before_fusion = np.sum(valid_fret < 0)
+
+if num_passed > 0:
+    mean_drop_time = np.mean(valid_fret)
+    std_drop_time = np.std(valid_fret, ddof=1)
+    fraction_before = num_before_fusion / num_passed
+
+    res_ttest = ttest_1samp(valid_fret, 0, alternative='less')
+    p_ttest = res_ttest.pvalue
+
+    res_sign = binomtest(num_before_fusion, num_passed, 0.5, alternative='greater')
+    p_signtest = res_sign.pvalue
+
+    res_wilcoxon = wilcoxon(valid_fret, alternative='less')
+    p_wilcoxon = res_wilcoxon.pvalue
+
+    cohens_d = abs(mean_drop_time) / std_drop_time
+else:
+    mean_drop_time = np.nan
+    std_drop_time = np.nan
+    fraction_before = np.nan
+    p_ttest = np.nan
+    p_signtest = np.nan
+    p_wilcoxon = np.nan
+    cohens_d = np.nan
+
+print('\n=== FINAL UNBIASED FRET ANALYSIS RESULTS ===')
+print(f'Total files valid for windowing/normalization: {total_analyzed}')
+print(f'Events showing a FRET drop passing threshold: {num_passed} of {total_analyzed}')
+if num_passed > 0:
+    print(f'Of those {num_passed} valid events, FRET drop preceded fusion in: {num_before_fusion} ({100 * fraction_before:.1f}%)')
+    print(f'Mean FRET drop time: {mean_drop_time:.2f} seconds relative to fusion')
+    print(f'Standard Deviation:  {std_drop_time:.2f} seconds\n')
+    print('--- DIRECTIONAL (ONE-TAILED) STATISTICAL COMPARISON ---')
+    print(f'1. One-Sample t-test p-value:    {p_ttest:.4f}')
+    print(f'2. Sign Test p-value:            {p_signtest:.4f}')
+    print(f'3. Wilcoxon signed-rank p-value: {p_wilcoxon:.4f}')
+    print(f'4. Cohen\'s d (Effect Size):      {cohens_d:.4f}')
+    print('-------------------------------------------------------')
+print('=============================================\n')
+
+# ==========================================
+# 6. Plotting (with saving)
+# ==========================================
+
+def save_figure(fig, base_name):
+    """Save the figure in all requested formats."""
+    for fmt in save_formats:
+        fig.savefig(f"{base_name}.{fmt}", dpi=300, bbox_inches='tight')
+        print(f"Saved {base_name}.{fmt}")
+
+# ---------- Plot 1: Mean ± SEM ----------
+fig1, ax1 = plt.subplots(figsize=(10, 6))
+fig1.patch.set_facecolor('white')
+
+ax1.errorbar(mean_time, mean_vesicle, yerr=sem_vesicle, color='blue',
+             label='Vesicle ± SEM', linewidth=2)
+ax1.set_xlabel('Time from Vesicle Fusion (s)', fontsize=12, fontname='Arial')
+ax1.set_ylabel('Vesicle Intensity (Normalized to 100%)', fontsize=12, fontname='Arial')
+ax1.set_ylim([0, 120])
+ax1.axvline(x=0, color='k', linestyle='--', label='Fusion (t=0)')
+
+ax2 = ax1.twinx()
+ax2.errorbar(mean_time, mean_ratio, yerr=sem_ratio, color='#D95319',
+             label='FRET Ratio ± SEM', linewidth=2)
+ax2.set_ylabel('Ratiometric FRET (Normalized to 100%)', fontsize=12, fontname='Arial')
+ax2.set_ylim([0, 120])
+
+fig1.suptitle('Synchronized Mean ± SEM: Vesicle and FRET', fontsize=14, fontname='Arial')
+
+lines1, labels1 = ax1.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right', prop={'family': 'Arial'})
+
+# No grid
+ax1.grid(False)
+ax2.grid(False)
+
+save_figure(fig1, 'Figure1_Mean_SEM')
+plt.show()
+
+# ---------- Plot 2: Histogram ----------
+if num_passed > 0:
+    fig2 = plt.figure(figsize=(8, 5), facecolor='white')
+    plt.hist(valid_fret, bins=np.arange(np.min(valid_fret)-0.25, np.max(valid_fret)+0.25, 0.5),
+             color='darkorange', edgecolor='black')
+    plt.axvline(x=0, color='k', linestyle='--', label='Fusion (t=0)')
+    plt.xlabel('FRET Drop Onset (s, rel. to fusion)', fontsize=12, fontname='Arial')
+    plt.ylabel('Number of Events', fontsize=12, fontname='Arial')
+    plt.title('Timing of FRET Drop Relative to Exocytosis', fontsize=14, fontname='Arial')
+    plt.grid(False)   # No grid
+    plt.legend(prop={'family': 'Arial'})
+    save_figure(fig2, 'Figure2_Histogram')
+    plt.show()
+
+    # ---------- Plot 3: Notched Boxplot ----------
+    fig3 = plt.figure(figsize=(4, 6), facecolor='white')
+    box = plt.boxplot(valid_fret, notch=True, widths=0.5, patch_artist=True, sym='')
+    for patch in box['boxes']:
+        patch.set_facecolor('white')
+        patch.set_edgecolor('gray')
+    for median in box['medians']:
+        median.set_color('gray')
+    for whisker in box['whiskers']:
+        whisker.set_color('gray')
+    for cap in box['caps']:
+        cap.set_color('gray')
+
+    jitter = np.random.uniform(-0.1, 0.1, size=len(valid_fret))
+    plt.scatter(1 + jitter, valid_fret, color='darkorange', zorder=3)
+
+    plt.plot(1, mean_drop_time, 'b.', markersize=15, zorder=4)
+    plt.text(0.55, mean_drop_time, f'Mean = {mean_drop_time:.2f}s',
+             color='blue', fontsize=12, fontweight='bold', va='center', fontname='Arial')
+
+    plt.ylabel('FRET Drop Time (s)', fontsize=12, fontname='Arial')
+    plt.xticks([])
+    plt.xlim([0.4, 1.6])
+    plt.grid(False)   # No grid
+    save_figure(fig3, 'Figure3_Boxplot')
+    plt.show()
+
+# ==========================================
+# 7. Save All Data to CSVs
+# ==========================================
+df_means = pd.DataFrame({
+    'Time_s': mean_time,
+    'Mean_Vesicle': mean_vesicle,
+    'SEM_Vesicle': sem_vesicle,
+    'Mean_Ratio': mean_ratio,
+    'SEM_Ratio': sem_ratio
+})
+df_means.to_csv('Aligned_Mean_SEM_DropOnset.csv', index=False)
+
+synch_data = []
+for j, (t, v, r) in enumerate(zip(all_times, all_vesicles, all_ratios)):
+    for k in range(len(t)):
+        synch_data.append({
+            'TraceID': j + 1,
+            'Time_s': round(t[k], 3),
+            'Vesicle_Norm': round(v[k], 2),
+            'FRET_Norm': round(r[k], 2)
+        })
+df_synch = pd.DataFrame(synch_data)
+df_synch.to_csv('All_Synchronized_Traces.csv', index=False)
+
+df_stats = pd.DataFrame({
+    'FileName': [os.path.basename(f) for f in csv_files],
+    'Absolute_Fusion_Time_s': fusion_times,
+    'FRET_Drop_Relative_to_Fusion_s': fret_drop_times,
+    'Passed_Threshold': passed_threshold
+})
+df_stats.to_csv('Robust_Unbiased_FRET_Results.csv', index=False)
+
+print('✅ Saved 3 CSVs and all figures (PNG, SVG, PDF) to current folder.')
